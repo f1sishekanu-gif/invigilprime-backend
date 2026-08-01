@@ -123,7 +123,8 @@ app.get('/', (req, res) => res.json({ ok: true, service: 'invigil-backend' }));
 // ---------------------------------------------------------------------------
 // POST /verify-code   { code: string }  ->  { ok: boolean }
 // ---------------------------------------------------------------------------
-app.post('/verify-code', restrictedCors, (req, res) => {
+app.use('/verify-code', restrictedCors);
+app.post('/verify-code', (req, res) => {
   const ip = clientIp(req);
   if (rateLimited(`code:${ip}`, 20, 60 * 1000)) {
     return res.status(429).json({ ok: false, error: 'Too many attempts — wait a minute and try again.' });
@@ -181,7 +182,8 @@ function normId(s) {
   return (s || '').toString().trim().toUpperCase().replace(/\s+/g, '');
 }
 
-app.post('/verify-student', restrictedCors, async (req, res) => {
+app.use('/verify-student', restrictedCors);
+app.post('/verify-student', async (req, res) => {
   const ip = clientIp(req);
   // Slightly tighter limit than /verify-code — this endpoint doubles as a
   // student-number oracle if hammered, so keep guesses expensive.
@@ -241,7 +243,8 @@ if (db && PUBLIC_APP_URL && PUBLIC_BACKEND_URL) {
 // this route's job is just the authenticated, server-signed handoff to
 // Moodle, not re-deriving the grade.
 // ---------------------------------------------------------------------------
-app.post('/lti/push-grade', restrictedCors, async (req, res) => {
+app.use('/lti/push-grade', restrictedCors);
+app.post('/lti/push-grade', async (req, res) => {
   if (!db) return res.status(500).json({ ok: false, error: 'Server not configured.' });
 
   const authHeader = req.headers.authorization || '';
