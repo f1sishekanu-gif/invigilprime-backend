@@ -110,7 +110,14 @@ function getSigningKey() {
   }
   const pem = Buffer.from(b64, 'base64').toString('utf8');
   signingKeyPromise = importPKCS8(pem, 'RS256').then(async (privateKey) => {
-    const publicJwk = await exportJWK(privateKey);
+    // CRITICAL: exportJWK() on a private KeyObject exports every field —
+    // including d, p, q, dp, dq, qi, the actual private key material.
+    // /lti/jwks.json is a PUBLIC endpoint by design (Moodle fetches it to
+    // verify our signatures), so publishing that JWK directly would leak
+    // the private key to anyone who requests the URL. Derive the public
+    // key from the private key first, and export ONLY that.
+    const publicKeyObject = crypto.createPublicKey(privateKey);
+    const publicJwk = await exportJWK(publicKeyObject);
     publicJwk.kid = kid;
     publicJwk.alg = 'RS256';
     publicJwk.use = 'sig';
