@@ -1,7 +1,7 @@
 {
   "name": "invigil-backend",
-  "version": "1.2.0",
-  "description": "Server-side access-code/register verification and LTI 1.3 Moodle integration for Invigil, deployed on Render.",
+  "version": "2.0.0",
+  "description": "Server-side access-code/register verification, LTI 1.3 Moodle integration, institutional access requests, Flutterwave billing, and Cloudflare R2 file storage for Invigil, deployed on Render.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -10,6 +10,8 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.637.0",
+    "@aws-sdk/s3-request-presigner": "^3.637.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "firebase-admin": "^12.3.0",

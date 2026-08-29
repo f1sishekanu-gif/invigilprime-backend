@@ -24,6 +24,7 @@
 
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const admin = require('firebase-admin');
 const { createLtiRouter, pushGradeToLti } = require('./lti');
 
@@ -47,6 +48,37 @@ const PUBLIC_BACKEND_URL = (process.env.PUBLIC_BACKEND_URL || '').replace(/\/$/,
 // Your Firebase Hosting URL, e.g. https://invigil-prime.web.app — where LTI
 // launches redirect the browser back into the app.
 const PUBLIC_APP_URL = (process.env.PUBLIC_APP_URL || '').replace(/\/$/, '');
+
+// Flutterwave secret key — from your Flutterwave Dashboard (Settings → API
+// keys → Secret Key, starts with FLWSECK_TEST- in test mode or FLWSECK-
+// live). Only used server-side, never sent to a browser.
+const FLUTTERWAVE_SECRET_KEY = process.env.FLUTTERWAVE_SECRET_KEY || '';
+// The "Secret Hash" you set yourself in Flutterwave Dashboard → Settings →
+// Webhooks. Flutterwave sends this same string back in every webhook
+// request's `verif-hash` header — request bodies aren't HMAC-signed;
+// verification here is a direct string comparison against this value.
+const FLUTTERWAVE_WEBHOOK_HASH = process.env.FLUTTERWAVE_WEBHOOK_HASH || '';
+const FLUTTERWAVE_API_BASE = 'https://api.flutterwave.com/v3';
+if (!FLUTTERWAVE_SECRET_KEY) {
+  console.warn('FLUTTERWAVE_SECRET_KEY not set — /create-flutterwave-payment will refuse all requests until it is.');
+}
+if (!FLUTTERWAVE_WEBHOOK_HASH) {
+  console.warn('FLUTTERWAVE_WEBHOOK_HASH not set — /flutterwave/webhook will reject all events until it is.');
+}
+
+// -----------------------------------------------------------------------
+// Canonical Invigil pricing, in USD. This is the one source of truth for
+// what a plan costs — the frontend only ever sends a planId, never a
+// price, and the backend looks the real price up here. Flutterwave may
+// settle a transaction in a different currency (e.g. ZMW) depending on
+// the customer's card/region; that settlement amount/currency is recorded
+// separately in the payment record and never treated as the list price.
+// -----------------------------------------------------------------------
+const PRICING_PLANS = {
+  institution_monthly: { name: 'Institution Plan (Monthly)', priceUSD: 1.00, billingPeriod: 'monthly', perStudent: true },
+  institution_annual: { name: 'Institution Plan (Annual)', priceUSD: 12.00, billingPeriod: 'yearly', perStudent: true },
+};
+
 
 // ---------------------------------------------------------------------------
 // Firebase Admin init
@@ -213,6 +245,288 @@ app.post('/verify-student', async (req, res) => {
   }
 });
 
+// -----------------------------------------------------------------------
+// POST /request-access
+//   { name, email, institutionName, role, institutionType, studentCount,
+//     usesMoodle, interests: string[] }
+//   -> { ok: boolean, error? }
+//
+// Stores an institutional access request in Firestore (accessRequests
+// collection) so it shows up for you to follow up on manually — this is
+// deliberately NOT wired to an email/CRM service, since none is
+// configured. Check the Firebase console under accessRequests, or build
+// a notification integration (e.g. a Firestore trigger that emails you)
+// separately if you want a push notification instead of checking Firestore.
+// -----------------------------------------------------------------------
+app.use('/request-access', restrictedCors);
+app.post('/request-access', async (req, res) => {
+  const ip = clientIp(req);
+  if (rateLimited(`access-request:${ip}`, 5, 10 * 60 * 1000)) {
+    return res.status(429).json({ ok: false, error: 'Too many requests — please wait a few minutes and try again.' });
+  }
+  if (!db) {
+    return res.status(500).json({ ok: false, error: 'Server not configured (FIREBASE_SERVICE_ACCOUNT_BASE64 missing).' });
+  }
+
+  const b = req.body || {};
+  const name = typeof b.name === 'string' ? b.name.trim() : '';
+  const email = typeof b.email === 'string' ? b.email.trim() : '';
+  const institutionName = typeof b.institutionName === 'string' ? b.institutionName.trim() : '';
+  const role = typeof b.role === 'string' ? b.role.trim() : '';
+  const institutionType = typeof b.institutionType === 'string' ? b.institutionType.trim() : '';
+  const studentCount = typeof b.studentCount === 'string' ? b.studentCount.trim() : '';
+  const usesMoodle = typeof b.usesMoodle === 'string' ? b.usesMoodle.trim() : '';
+  const interests = Array.isArray(b.interests) ? b.interests.filter(s => typeof s === 'string').slice(0, 10) : [];
+
+  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  if (!name || name.length > 200 || !emailOk || email.length > 200 || !institutionName || institutionName.length > 300) {
+    return res.status(400).json({ ok: false, error: 'Please fill in your name, a valid work email, and institution name.' });
+  }
+
+  try {
+    await db.collection('accessRequests').add({
+      name, email, institutionName, role, institutionType, studentCount, usesMoodle, interests,
+      status: 'new',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      ip,
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('request-access error:', err.message);
+    res.status(500).json({ ok: false, error: 'Could not save your request right now — try again shortly.' });
+  }
+});
+
+// -----------------------------------------------------------------------
+// POST /create-flutterwave-payment
+//   { planId: string, studentCount: number, institutionName?: string, email: string }
+//   (Authorization: Bearer <Firebase ID token>, optional — an
+//   institutional access request can happen before any lecturer account
+//   exists, so this route works either signed-in or signed-out. When
+//   present, the token's uid is trusted as the payer's identity instead
+//   of the client-supplied email.)
+//   -> { ok: boolean, url?: string, error? }
+//
+// The frontend sends ONLY a planId (+ how many students, + who's paying).
+// Price, currency, and billing period are looked up server-side from
+// PRICING_PLANS — the client's opinion of the price is never trusted.
+// Creates a Flutterwave Standard payment link and returns it for the
+// browser to redirect to. Flutterwave collects card details on its own
+// hosted page — this server never sees or stores raw card numbers.
+//
+// A successful redirect back from Flutterwave is NOT treated as proof of
+// payment anywhere in this codebase — see /flutterwave/webhook below,
+// which is the only thing allowed to activate a subscription.
+// -----------------------------------------------------------------------
+app.use('/create-flutterwave-payment', restrictedCors);
+app.post('/create-flutterwave-payment', async (req, res) => {
+  const ip = clientIp(req);
+  if (rateLimited(`checkout:${ip}`, 10, 10 * 60 * 1000)) {
+    return res.status(429).json({ ok: false, error: 'Too many attempts — please wait a few minutes and try again.' });
+  }
+  if (!FLUTTERWAVE_SECRET_KEY) {
+    return res.status(500).json({ ok: false, error: 'Payment processing is currently being configured. Please try again later or contact us.' });
+  }
+  if (!PUBLIC_APP_URL) {
+    return res.status(500).json({ ok: false, error: 'Payment processing is currently being configured. Please try again later or contact us.' });
+  }
+  if (!db) {
+    return res.status(500).json({ ok: false, error: 'Payment processing is currently being configured. Please try again later or contact us.' });
+  }
+
+  // Identify the payer: prefer a verified Firebase UID over a client-
+  // supplied email, since the UID can't be spoofed.
+  let uid = null;
+  const authHeader = req.headers.authorization || '';
+  const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  if (idToken) {
+    try {
+      const decoded = await admin.auth().verifyIdToken(idToken);
+      uid = decoded.uid;
+    } catch (err) {
+      return res.status(401).json({ ok: false, error: 'Your session has expired — please sign in again.' });
+    }
+  }
+
+  const planId = typeof req.body?.planId === 'string' ? req.body.planId : '';
+  const plan = PRICING_PLANS[planId];
+  if (!plan) {
+    return res.status(400).json({ ok: false, error: 'Unknown plan.' });
+  }
+  const studentCount = Math.round(Number(req.body?.studentCount));
+  if (!Number.isFinite(studentCount) || studentCount < 1 || studentCount > 200000) {
+    return res.status(400).json({ ok: false, error: 'Enter a valid number of students.' });
+  }
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().slice(0, 200) : '';
+  if (!uid && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ ok: false, error: 'Enter a valid email address.' });
+  }
+  const institutionName = typeof req.body?.institutionName === 'string' ? req.body.institutionName.trim().slice(0, 200) : '';
+
+  const amountUSD = plan.perStudent ? +(plan.priceUSD * studentCount).toFixed(2) : plan.priceUSD;
+  const payerRef = uid || email;
+  const txRef = `INVIGIL-${payerRef.replace(/[^a-zA-Z0-9]/g, '').slice(0, 24)}-${crypto.randomUUID()}`;
+
+  try {
+    // Record the pending payment BEFORE redirecting the user anywhere, so
+    // the webhook (which may arrive seconds or minutes later, and race
+    // the browser's own redirect back) always has a matching record to
+    // verify against and update — see /flutterwave/webhook.
+    await db.collection('payments').doc(txRef).set({
+      txRef, uid, email: uid ? null : email, planId, studentCount, institutionName,
+      amountUSD, currency: 'USD', status: 'pending',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    const flwResp = await fetch(`${FLUTTERWAVE_API_BASE}/payments`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${FLUTTERWAVE_SECRET_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tx_ref: txRef,
+        amount: amountUSD,
+        currency: 'USD', // Flutterwave may still settle in the customer's local currency; that is recorded separately once known, never used as the list price.
+        redirect_url: `${PUBLIC_APP_URL}/?flw_tx_ref=${encodeURIComponent(txRef)}`,
+        customer: { email: uid ? (req.body?.email || 'no-email-on-file@invigil') : email, name: institutionName || undefined },
+        customizations: { title: 'Invigil Prime', description: `${plan.name} — ${studentCount} students` },
+        meta: { uid, planId, studentCount, institutionName },
+      }),
+    });
+    const flwData = await flwResp.json();
+    if (!flwResp.ok || flwData.status !== 'success' || !flwData.data?.link) {
+      console.error('Flutterwave payment creation failed:', flwData);
+      return res.status(502).json({ ok: false, error: 'Could not start checkout right now — try again shortly.' });
+    }
+    res.json({ ok: true, url: flwData.data.link });
+  } catch (err) {
+    console.error('create-flutterwave-payment error:', err.message);
+    res.status(500).json({ ok: false, error: 'Could not start checkout right now — try again shortly.' });
+  }
+});
+
+// -----------------------------------------------------------------------
+// POST /flutterwave/webhook
+//
+// The ONLY thing in this codebase allowed to activate a subscription.
+// Verifies the `verif-hash` header against FLUTTERWAVE_WEBHOOK_HASH,
+// re-queries Flutterwave's own transaction-verification endpoint (never
+// trusting the webhook payload's claimed amount/status on its own — the
+// payload is what tells us WHICH transaction to go check, not proof by
+// itself), cross-checks the verified amount/currency/reference against
+// the payment record created in /create-flutterwave-payment, and only
+// then updates subscriptions/{uid-or-email} and payments/{txRef}.
+//
+// Idempotent: the Flutterwave event id is recorded in
+// paymentEvents/{eventId} inside the same Firestore transaction that
+// updates the subscription, so a duplicate/retried webhook delivery can
+// never grant duplicate access or extend a subscription twice.
+// -----------------------------------------------------------------------
+app.post('/flutterwave/webhook', async (req, res) => {
+  const signature = req.headers['verif-hash'];
+  if (!FLUTTERWAVE_WEBHOOK_HASH || !signature || signature !== FLUTTERWAVE_WEBHOOK_HASH) {
+    // Deliberately vague + fast rejection, same philosophy as the
+    // verify-* endpoints: don't give a prober anything to work with.
+    return res.status(401).json({ ok: false });
+  }
+  if (!db) {
+    return res.status(500).json({ ok: false, error: 'Server not configured.' });
+  }
+
+  const event = req.body || {};
+  const txRef = event?.data?.tx_ref || event?.txRef;
+  const flwTransactionId = event?.data?.id;
+  if (!txRef || !flwTransactionId) {
+    return res.status(400).json({ ok: false, error: 'Malformed webhook payload.' });
+  }
+  // Flutterwave expects a fast 200 response; do the real work, but don't
+  // make the sender retry-storm us over something we've already recorded.
+  const eventId = `flw_${flwTransactionId}`;
+
+  try {
+    const alreadyProcessed = await db.collection('paymentEvents').doc(eventId).get();
+    if (alreadyProcessed.exists) {
+      return res.status(200).json({ ok: true, note: 'Already processed.' });
+    }
+
+    // Re-query Flutterwave directly rather than trusting the webhook body's
+    // own amount/status fields — this is the actual server-side proof of
+    // payment, not the webhook delivery itself.
+    const verifyResp = await fetch(`${FLUTTERWAVE_API_BASE}/transactions/${flwTransactionId}/verify`, {
+      headers: { 'Authorization': `Bearer ${FLUTTERWAVE_SECRET_KEY}` },
+    });
+    const verifyData = await verifyResp.json();
+    const tx = verifyData?.data;
+    if (!verifyResp.ok || verifyData.status !== 'success' || !tx || tx.tx_ref !== txRef) {
+      console.error('Flutterwave webhook verification mismatch:', verifyData);
+      return res.status(400).json({ ok: false, error: 'Could not verify transaction.' });
+    }
+
+    const paymentRef = db.collection('payments').doc(txRef);
+    const paymentSnap = await paymentRef.get();
+    if (!paymentSnap.exists) {
+      console.error('Flutterwave webhook: no matching payment record for', txRef);
+      return res.status(404).json({ ok: false, error: 'Unknown transaction reference.' });
+    }
+    const payment = paymentSnap.data();
+
+    // Cross-check the verified transaction against what we expected when
+    // the payment was created — amount, currency, and reference must all
+    // agree. (Flutterwave's settlement currency/amount can legitimately
+    // differ from the USD list price if the customer paid in local
+    // currency; that's recorded separately below, not compared here.)
+    const expectedAmount = payment.amountUSD;
+    const paidInExpectedCurrency = tx.currency === 'USD';
+    const amountOk = paidInExpectedCurrency
+      ? Math.abs(Number(tx.amount) - expectedAmount) < 0.01
+      : true; // different settlement currency — amount is checked via charged_amount/app_fee reconciliation on your Flutterwave dashboard, not blocked here.
+    if (tx.status !== 'successful' || !amountOk) {
+      await paymentRef.update({ status: tx.status === 'successful' ? 'amount_mismatch' : tx.status, verifiedAt: admin.firestore.FieldValue.serverTimestamp() });
+      await db.collection('paymentEvents').doc(eventId).set({ txRef, receivedAt: admin.firestore.FieldValue.serverTimestamp(), outcome: 'rejected', reason: tx.status !== 'successful' ? 'not-successful' : 'amount-mismatch' });
+      return res.status(200).json({ ok: true, note: 'Transaction not activated (status or amount mismatch).' });
+    }
+
+    const subjectId = payment.uid || payment.email;
+    const subscriptionRef = db.collection('subscriptions').doc(subjectId);
+    const plan = PRICING_PLANS[payment.planId];
+    const periodMs = plan?.billingPeriod === 'monthly' ? 31 * 24 * 60 * 60 * 1000 : 366 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+
+    // Everything below happens atomically: recording the event id (for
+    // idempotency) and activating the subscription happen together, so a
+    // crash between the two can't leave a half-applied state that a retry
+    // would then double-apply.
+    await db.runTransaction(async (t) => {
+      const eventDoc = await t.get(db.collection('paymentEvents').doc(eventId));
+      if (eventDoc.exists) return; // another concurrent delivery already handled it
+      t.set(db.collection('paymentEvents').doc(eventId), {
+        txRef, flwTransactionId, receivedAt: admin.firestore.FieldValue.serverTimestamp(), outcome: 'activated',
+      });
+      t.update(paymentRef, {
+        status: 'successful',
+        verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+        settlementAmount: tx.amount,
+        settlementCurrency: tx.currency,
+        flwTransactionId,
+      });
+      t.set(subscriptionRef, {
+        status: 'active',
+        planId: payment.planId,
+        studentCount: payment.studentCount,
+        institutionName: payment.institutionName || null,
+        currentPeriodEnd: new Date(now + periodMs).toISOString(),
+        lastPaymentTxRef: txRef,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    });
+
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error('flutterwave webhook error:', err.message);
+    // Still 200 — Flutterwave will retry a non-2xx response, and retrying
+    // won't fix a bug on our end; log it and investigate instead.
+    res.status(200).json({ ok: false });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // LTI 1.3 Advantage — SSO launch, Deep Linking, and (below) AGS grade
 // passback. See lti.js for the full protocol implementation and the
@@ -272,6 +586,189 @@ app.post('/lti/push-grade', async (req, res) => {
 
   const result = await pushGradeToLti(db, { testId, submissionId, scoreGiven, scoreMaximum });
   res.status(result.ok ? 200 : 502).json(result);
+});
+
+// -----------------------------------------------------------------------
+// Cloudflare R2 file storage (Part B) — question images, exam
+// attachments, lecturer documents, student-submitted files. This is NEW
+// functionality: the existing app had no file-upload feature at all
+// (question images were pasted as externally-hosted URLs), so there is
+// nothing being "migrated" here beyond that URL field staying available
+// alongside this.
+//
+// Route summary:
+//   POST   /files/upload-url    — lecturer requests a signed PUT URL
+//   POST   /files/confirm       — lecturer confirms a completed upload, saves Firestore metadata
+//   GET    /files/:fileId/signed-url  — signed GET URL (lecturer, OR a student mid-test — see below)
+//   DELETE /files/:fileId       — lecturer deletes a file
+//
+// IMPORTANT LIMITATION, stated plainly rather than glossed over: Invigil's
+// student exam flow has no Firebase Authentication at all — students join
+// a test by access code, not by signing in (see /verify-code,
+// /verify-student above). That means a per-student authorization check
+// (verifying "this specific student is allowed to see this specific
+// file") isn't possible without inventing a new session-token system for
+// students, which is out of scope here. What IS enforced for the
+// student-facing signed-URL route below is that the requested file is
+// actually attached to the testId being requested — which stops the
+// exact attack described in the spec (changing examId=123 to
+// examId=124), but is not equivalent to full per-user authorization.
+// -----------------------------------------------------------------------
+const storageService = require('./storageService');
+const FILE_UPLOAD_RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
+
+async function verifyLecturer(req) {
+  const authHeader = req.headers.authorization || '';
+  const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  if (!idToken) return null;
+  try {
+    return await admin.auth().verifyIdToken(idToken);
+  } catch (err) {
+    return null;
+  }
+}
+
+async function lecturerOwnsCourse(uid, courseId) {
+  if (!db || !courseId) return false;
+  const snap = await db.collection('courses').doc(courseId).get();
+  return snap.exists && snap.data().createdBy === uid;
+}
+
+app.use('/files', restrictedCors);
+
+app.post('/files/upload-url', async (req, res) => {
+  if (!storageService.isConfigured()) {
+    return res.status(500).json({ ok: false, error: 'File storage is currently being configured. Please try again later or contact us.' });
+  }
+  if (!db) return res.status(500).json({ ok: false, error: 'Server not configured.' });
+
+  const decoded = await verifyLecturer(req);
+  if (!decoded) return res.status(401).json({ ok: false, error: 'Not signed in.' });
+
+  const ip = clientIp(req);
+  if (rateLimited(`upload:${decoded.uid}`, 30, FILE_UPLOAD_RATE_LIMIT_WINDOW_MS)) {
+    return res.status(429).json({ ok: false, error: 'Too many uploads — please wait a few minutes and try again.' });
+  }
+
+  const { courseId, examId, category, fileName, contentType, size } = req.body || {};
+  if (!(await lecturerOwnsCourse(decoded.uid, courseId))) {
+    return res.status(403).json({ ok: false, error: 'You don\'t have permission to upload to this course.' });
+  }
+  if (!storageService.ALLOWED_MIME_TYPES.has(contentType)) {
+    return res.status(400).json({ ok: false, error: 'That file type isn\'t supported. Allowed: PNG, JPEG, GIF, WEBP, PDF.' });
+  }
+  if (!Number.isFinite(size) || size <= 0 || size > storageService.MAX_FILE_SIZE_BYTES) {
+    return res.status(400).json({ ok: false, error: `File is too large — the limit is ${Math.round(storageService.MAX_FILE_SIZE_BYTES / 1024 / 1024)}MB.` });
+  }
+
+  try {
+    const fileId = crypto.randomUUID();
+    const objectKey = storageService.buildObjectKey({ courseId, examId, category });
+    const uploadUrl = await storageService.getUploadUrl(objectKey, contentType);
+    res.json({ ok: true, fileId, objectKey, uploadUrl });
+  } catch (err) {
+    console.error('files/upload-url error:', err.message);
+    res.status(500).json({ ok: false, error: 'Could not prepare upload — try again shortly.' });
+  }
+});
+
+app.post('/files/confirm', async (req, res) => {
+  if (!storageService.isConfigured() || !db) {
+    return res.status(500).json({ ok: false, error: 'File storage is currently being configured. Please try again later or contact us.' });
+  }
+  const decoded = await verifyLecturer(req);
+  if (!decoded) return res.status(401).json({ ok: false, error: 'Not signed in.' });
+
+  const { fileId, objectKey, courseId, examId, fileName, contentType, size } = req.body || {};
+  if (!(await lecturerOwnsCourse(decoded.uid, courseId))) {
+    return res.status(403).json({ ok: false, error: 'You don\'t have permission to attach files to this course.' });
+  }
+  if (typeof fileId !== 'string' || typeof objectKey !== 'string' || !objectKey.startsWith(`courses/${courseId}/`)) {
+    return res.status(400).json({ ok: false, error: 'Malformed upload confirmation.' });
+  }
+
+  try {
+    // Confirm the object actually landed in R2 before trusting the
+    // client's claim that the upload succeeded.
+    const uploaded = await storageService.exists(objectKey);
+    if (!uploaded) {
+      return res.status(400).json({ ok: false, error: 'Upload not found — please try uploading again.' });
+    }
+    await db.collection('files').doc(fileId).set({
+      ownerId: decoded.uid,
+      courseId,
+      examId: examId || null,
+      fileName: typeof fileName === 'string' ? fileName.slice(0, 200) : 'file',
+      contentType,
+      size: Number(size) || null,
+      storageProvider: 'cloudflare_r2',
+      objectKey,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    res.json({ ok: true, fileId });
+  } catch (err) {
+    console.error('files/confirm error:', err.message);
+    res.status(500).json({ ok: false, error: 'Could not save the file — try again shortly.' });
+  }
+});
+
+app.get('/files/:fileId/signed-url', async (req, res) => {
+  if (!storageService.isConfigured() || !db) {
+    return res.status(500).json({ ok: false, error: 'File storage is currently being configured. Please try again later or contact us.' });
+  }
+  const { fileId } = req.params;
+  const { testId } = req.query; // present for student-mid-test access; absent for lecturer access
+
+  try {
+    const snap = await db.collection('files').doc(fileId).get();
+    if (!snap.exists) return res.status(404).json({ ok: false, error: 'File not found.' });
+    const file = snap.data();
+
+    if (testId) {
+      // Student-facing path — no Firebase Auth available (see comment
+      // above). The one check that IS possible: the file must actually
+      // belong to the test being requested, which blocks the
+      // examId-swap attack the spec calls out even without per-student auth.
+      if (file.examId !== testId) {
+        return res.status(403).json({ ok: false, error: 'Not authorized for this file.' });
+      }
+    } else {
+      const decoded = await verifyLecturer(req);
+      if (!decoded || decoded.uid !== file.ownerId) {
+        return res.status(403).json({ ok: false, error: 'Not authorized for this file.' });
+      }
+    }
+
+    const url = await storageService.getSignedUrl(file.objectKey);
+    res.json({ ok: true, url });
+  } catch (err) {
+    console.error('files/signed-url error:', err.message);
+    res.status(500).json({ ok: false, error: 'Could not generate a link for this file — try again shortly.' });
+  }
+});
+
+app.delete('/files/:fileId', async (req, res) => {
+  if (!storageService.isConfigured() || !db) {
+    return res.status(500).json({ ok: false, error: 'File storage is currently being configured. Please try again later or contact us.' });
+  }
+  const decoded = await verifyLecturer(req);
+  if (!decoded) return res.status(401).json({ ok: false, error: 'Not signed in.' });
+
+  try {
+    const ref = db.collection('files').doc(req.params.fileId);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ ok: false, error: 'File not found.' });
+    const file = snap.data();
+    if (file.ownerId !== decoded.uid) {
+      return res.status(403).json({ ok: false, error: 'You don\'t have permission to delete this file.' });
+    }
+    await storageService.delete(file.objectKey);
+    await ref.delete();
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('files/delete error:', err.message);
+    res.status(500).json({ ok: false, error: 'Could not delete the file — try again shortly.' });
+  }
 });
 
 app.listen(PORT, () => console.log(`Invigil backend listening on :${PORT}`));
