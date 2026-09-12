@@ -28,6 +28,14 @@ const crypto = require('crypto');
 const admin = require('firebase-admin');
 const { createLtiRouter, pushGradeToLti } = require('./lti');
 
+// Wraps an async route handler so a rejected promise is forwarded to
+// Express's error-handling middleware via next(err), instead of becoming an
+// unhandled promise rejection. In Express 4, an async handler that throws
+// (e.g. a transient Firestore error) is NOT caught automatically — left
+// unguarded, that can crash the whole Node process, taking the server down
+// for every user rather than just failing the one request.
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
 const app = express();
 app.use(express.json({ limit: '10kb' })); // requests here are tiny; reject anything else outright
 // LTI launches and Deep Linking responses arrive as browser form_posts
@@ -558,7 +566,7 @@ if (db && PUBLIC_APP_URL && PUBLIC_BACKEND_URL) {
 // Moodle, not re-deriving the grade.
 // ---------------------------------------------------------------------------
 app.use('/lti/push-grade', restrictedCors);
-app.post('/lti/push-grade', async (req, res) => {
+app.post('/lti/push-grade', asyncHandler(async (req, res) => {
   if (!db) return res.status(500).json({ ok: false, error: 'Server not configured.' });
 
   const authHeader = req.headers.authorization || '';
@@ -586,7 +594,7 @@ app.post('/lti/push-grade', async (req, res) => {
 
   const result = await pushGradeToLti(db, { testId, submissionId, scoreGiven, scoreMaximum });
   res.status(result.ok ? 200 : 502).json(result);
-});
+}));
 
 // -----------------------------------------------------------------------
 // Cloudflare R2 file storage (Part B) — question images, exam
@@ -769,6 +777,17 @@ app.delete('/files/:fileId', async (req, res) => {
     console.error('files/delete error:', err.message);
     res.status(500).json({ ok: false, error: 'Could not delete the file — try again shortly.' });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Global error handler — catches anything forwarded via asyncHandler's
+// next(err) (currently just /lti/push-grade) so a transient failure returns
+// a normal 500 response instead of crashing the process.
+// ---------------------------------------------------------------------------
+app.use((err, req, res, next) => {
+  console.error(`${req.method} ${req.path} error:`, err && err.message);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ ok: false, error: 'Something went wrong — try again shortly.' });
 });
 
 app.listen(PORT, () => console.log(`Invigil backend listening on :${PORT}`));

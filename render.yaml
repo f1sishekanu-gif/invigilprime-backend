@@ -3,7 +3,6 @@ services:
     name: invigil-backend
     runtime: node
     plan: free
-    rootDir: server
     buildCommand: npm install
     startCommand: npm start
     envVars:
@@ -13,3 +12,25 @@ services:
         sync: false   # comma-separated Hosting URLs, e.g. https://invigil-prime.web.app,https://invigil-prime.firebaseapp.com
       - key: FIREBASE_SERVICE_ACCOUNT_BASE64
         sync: false   # base64 of your service-account JSON — see README "5b" — never commit this
+      - key: PUBLIC_APP_URL
+        sync: false   # the deployed Firebase Hosting URL for the frontend, e.g. https://invigil-prime.web.app
+      - key: PUBLIC_BACKEND_URL
+        sync: false   # this Render service's own public URL, e.g. https://invigilprime-backend.onrender.com
+      - key: LTI_PRIVATE_KEY_BASE64
+        sync: false   # base64 of the RSA private key used to sign LTI client-assertion JWTs — never commit this
+      - key: LTI_KID
+        sync: false   # key ID matching the public key published in your LTI JWKS
+      - key: FLUTTERWAVE_SECRET_KEY
+        sync: false   # Flutterwave live/test secret key — never commit this
+      - key: FLUTTERWAVE_WEBHOOK_HASH
+        sync: false   # shared secret used to verify incoming Flutterwave webhook signatures
+      - key: R2_ACCOUNT_ID
+        sync: false   # Cloudflare account ID for the R2 bucket
+      - key: R2_ACCESS_KEY_ID
+        sync: false   # R2 S3-compatible API access key ID
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false   # R2 S3-compatible API secret key — never commit this
+      - key: R2_BUCKET_NAME
+        sync: false   # name of the R2 bucket used for file storage
+      - key: R2_PUBLIC_BASE_URL
+        sync: false   # public base URL for serving/signing R2 objects, e.g. your R2.dev or custom domain
