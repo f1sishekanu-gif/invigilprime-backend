@@ -141,6 +141,18 @@ function rateLimited(key, max, windowMs) {
   hits.set(key, arr);
   return arr.length > max;
 }
+// Peeks at how long until the oldest currently-counted hit for this key
+// ages out of the window — i.e. the earliest possible moment a new slot
+// could open up. Read-only: doesn't touch the bucket, so it's safe to call
+// after rateLimited() has already recorded this request. Used only to give
+// the client an honest retry time (see /verify-student below) instead of a
+// guessed delay that may be far too short for the actual window.
+function msUntilSlotMightFree(key, windowMs) {
+  const arr = hits.get(key) || [];
+  if (!arr.length) return 0;
+  const oldest = arr[0];
+  return Math.max(0, windowMs - (Date.now() - oldest));
+}
 // Periodic cleanup so `hits` doesn't grow forever on a long-lived instance.
 setInterval(() => {
   const now = Date.now();
@@ -225,11 +237,6 @@ function normId(s) {
 app.use('/verify-student', restrictedCors);
 app.post('/verify-student', async (req, res) => {
   const ip = clientIp(req);
-  // Slightly tighter limit than /verify-code — this endpoint doubles as a
-  // student-number oracle if hammered, so keep guesses expensive.
-  if (rateLimited(`student:${ip}`, 15, 60 * 1000)) {
-    return res.status(429).json({ ok: false, error: 'Too many attempts — wait a minute and try again.' });
-  }
   if (!db) {
     return res.status(500).json({ ok: false, error: 'Server not configured (FIREBASE_SERVICE_ACCOUNT_BASE64 missing).' });
   }
@@ -239,6 +246,32 @@ app.post('/verify-student', async (req, res) => {
   const studentId = typeof req.body?.studentId === 'string' ? req.body.studentId : '';
   if (!testId || testId.length > 100 || !name || name.length > 200 || !studentId || studentId.length > 100) {
     return res.json({ ok: false });
+  }
+
+  // Two limiters, each doing a different job — replaces a single per-IP
+  // limit that (verified by load-testing during the resilience audit)
+  // couldn't actually tell "one attacker" apart from "eighty students on
+  // the same campus wifi," and rejected the entire class for the first
+  // several minutes of any exam. Splitting the job fixes that without
+  // loosening the actual security property:
+  //   - per credential pair (this exact student, on this exact test):
+  //     stops rapid guessing AGAINST one identity, which is the real
+  //     brute-force threat here. Tight (8 / 5 min), but far more than a
+  //     genuine student needs even with a couple of typos.
+  //   - per IP: a backstop against raw volumetric abuse — spraying many
+  //     DIFFERENT guessed identities fast from one source — sized for a
+  //     genuinely large single exam venue (verified by load-testing: a
+  //     lecture hall of ~950+ students all sharing one IP started
+  //     tripping a 1000/5min ceiling, so this is set with real headroom
+  //     above that) rather than for one person at a time.
+  const credKey = `student-cred:${testId}:${normId(studentId)}`;
+  const ipKey = `student-ip:${ip}`;
+  const credLimited = rateLimited(credKey, 8, 5 * 60 * 1000);
+  const ipLimited = rateLimited(ipKey, 4000, 5 * 60 * 1000);
+  if (credLimited || ipLimited) {
+    const limitedKey = credLimited ? credKey : ipKey;
+    const retryAfterSec = Math.ceil(msUntilSlotMightFree(limitedKey, 5 * 60 * 1000) / 1000);
+    return res.status(429).json({ ok: false, error: 'Too many attempts — wait a bit and try again.', retryAfterSec });
   }
 
   try {

@@ -143,6 +143,26 @@ h1{font-size:19px}p{font-size:14.5px;line-height:1.6;color:#444}</style></head>
 <body><h1>${title}</h1><p>${detail}</p></body></html>`);
 }
 
+// Custom-parameter names have an unresolved case-sensitivity question:
+// LTI 1.0/1.1 explicitly lowercased custom_ parameter names (they were
+// plain form fields), and Moodle's LTI module is a descendant of that
+// era's codebase — but LTI 1.3's `custom` claim is a genuine JSON object
+// with no inherited form-field character restrictions, and IMS's own
+// LTI 1.3 documentation doesn't repeat the 1.1-era normalization rule for
+// it. Without a live Moodle instance to observe directly, there's no way
+// to be certain which behavior a real deployment exhibits for a
+// tool-generated Deep Linking custom property (as opposed to an
+// admin-typed one) — so look up custom parameters case-insensitively
+// rather than betting the entire post-Deep-Linking launch flow on one
+// specific casing. Costs nothing when the exact case already matches.
+function getCustomParam(custom, name) {
+  if (!custom || typeof custom !== 'object') return null;
+  if (custom[name] !== undefined) return custom[name];
+  const lower = name.toLowerCase();
+  const key = Object.keys(custom).find(k => k.toLowerCase() === lower);
+  return key ? custom[key] : null;
+}
+
 // Roles claim is a list of full URNs, e.g.
 // "http://purl.imsglobal.org/vocab/lis/v2/membership#Instructor" — we just
 // check whether any of them ends in a name we treat as instructor-level.
@@ -320,7 +340,7 @@ function createLtiRouter(db, admin, opts) {
       // testId travels as a custom parameter set at Deep Linking time
       // (see buildContentItem below) — the standards-compliant equivalent
       // of the old manual "?testId=" instructions.
-      const testId = custom.testId || null;
+      const testId = getCustomParam(custom, 'testId') || null;
       const ags = payload[LTI_CLAIM.ags];
       const lineitemUrl = ags && ags.lineitem ? ags.lineitem : null;
 
@@ -401,7 +421,7 @@ function createLtiRouter(db, admin, opts) {
       const custom = launch.custom || {};
       return res.json({
         ok: true, role: 'student', testId: launch.testId,
-        name: launch.name, studentId: custom.studentid || launch.sub,
+        name: launch.name, studentId: getCustomParam(custom, 'studentid') || launch.sub,
         viaLti: true,
         ltiSub: launch.sub, ltiPlatformId: launch.platformId, ltiLineitemUrl: launch.lineitemUrl || null,
       });
@@ -508,6 +528,40 @@ function createLtiRouter(db, admin, opts) {
 // the platform's token endpoint, then POSTs the score to the AGS scores
 // endpoint. Returns { ok, error? }.
 // ---------------------------------------------------------------------------
+// Bounded retry for AGS calls — per the self-healing audit's distinction
+// (§11): a network blip or a Moodle-side 5xx is a temporary communication
+// failure worth retrying (the score POST is idempotent — resubmitting the
+// same score doesn't create a duplicate grade record, it just re-confirms
+// the same value), but a 4xx (bad credentials, bad scope, malformed
+// request) is a real refusal that retrying verbatim will not fix — and
+// retrying it anyway would just look like repeated unauthorized attempts
+// to Moodle's own logging, which is the opposite of "do not weaken LTI
+// security for convenience." Capped at 3 attempts with short backoff —
+// this runs when a lecturer views results or grades are pushed, not
+// during time-sensitive student-facing flow, so it can afford to wait a
+// few seconds but must still give up and report clearly, not hang.
+async function fetchWithBoundedRetry(url, opts, { maxAttempts = 3, baseDelayMs = 1000 } = {}) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const resp = await fetch(url, opts);
+      if (resp.ok) return { resp };
+      if (resp.status >= 500 && attempt < maxAttempts) {
+        lastErr = new Error(`server error ${resp.status}`);
+        await new Promise(r => setTimeout(r, baseDelayMs * attempt));
+        continue;
+      }
+      return { resp }; // 4xx, or out of attempts — hand back to caller as-is, no more retrying
+    } catch (err) {
+      // A thrown fetch (DNS failure, connection refused, timeout) is
+      // exactly the "temporary communication failure" case — retry.
+      lastErr = err;
+      if (attempt < maxAttempts) await new Promise(r => setTimeout(r, baseDelayMs * attempt));
+    }
+  }
+  throw lastErr;
+}
+
 async function pushGradeToLti(db, { testId, submissionId, scoreGiven, scoreMaximum }) {
   const subSnap = await db.collection('tests').doc(testId).collection('submissions').doc(submissionId).get();
   if (!subSnap.exists) return { ok: false, error: 'Submission not found.' };
@@ -542,7 +596,7 @@ async function pushGradeToLti(db, { testId, submissionId, scoreGiven, scoreMaxim
 
   let accessToken;
   try {
-    const tokenResp = await fetch(platform.authTokenUrl, {
+    const { resp: tokenResp } = await fetchWithBoundedRetry(platform.authTokenUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -556,13 +610,13 @@ async function pushGradeToLti(db, { testId, submissionId, scoreGiven, scoreMaxim
     const tokenJson = await tokenResp.json();
     accessToken = tokenJson.access_token;
   } catch (err) {
-    return { ok: false, error: 'Could not reach Moodle\'s token endpoint.' };
+    return { ok: false, error: 'Could not reach Moodle\'s token endpoint after retrying.' };
   }
 
   // Step 2: POST the score to the lineitem's /scores endpoint.
   try {
     const scoresUrl = sub.ltiLineitemUrl.replace(/\/?$/, '') + '/scores';
-    const scoreResp = await fetch(scoresUrl, {
+    const { resp: scoreResp } = await fetchWithBoundedRetry(scoresUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/vnd.ims.lis.v1.score+json',
@@ -579,7 +633,7 @@ async function pushGradeToLti(db, { testId, submissionId, scoreGiven, scoreMaxim
     });
     if (!scoreResp.ok) return { ok: false, error: `Moodle rejected the score (${scoreResp.status}).` };
   } catch (err) {
-    return { ok: false, error: 'Could not reach Moodle\'s grade endpoint.' };
+    return { ok: false, error: 'Could not reach Moodle\'s grade endpoint after retrying.' };
   }
 
   return { ok: true };
