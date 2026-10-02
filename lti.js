@@ -80,6 +80,11 @@ const NONCE_TTL_MS = 10 * 60 * 1000;
 // object (and its own cache) on every single launch.
 const remoteJwksCache = new Map(); // jwksUrl -> ReturnType<createRemoteJWKSet>
 
+// Express 4 does not catch rejected promises from async handlers; an
+// unguarded Firestore hiccup becomes an unhandled rejection and can crash the
+// whole process mid-exam. Forward errors to the app's error handler instead.
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
 function randomToken(bytes = 24) {
   return crypto.randomBytes(bytes).toString('base64url');
 }
@@ -240,15 +245,15 @@ function createLtiRouter(db, admin, opts) {
 
     res.redirect(302, authUrl.toString());
   }
-  router.get('/login', handleLogin);
-  router.post('/login', handleLogin);
+  router.get('/login', wrap(handleLogin));
+  router.post('/login', wrap(handleLogin));
 
   // -------------------------------------------------------------------
   // POST /lti/launch — the actual LTI message, delivered as a form_post
   // containing a signed id_token. Verifies it, then branches on message
   // type and redirects the browser into the app with a one-time code.
   // -------------------------------------------------------------------
-  router.post('/launch', async (req, res) => {
+  router.post('/launch', wrap(async (req, res) => {
     const { id_token, state } = req.body;
     if (!id_token || !state) {
       return htmlError(res, 400, 'Malformed launch', 'Missing id_token or state.');
@@ -281,6 +286,8 @@ function createLtiRouter(db, admin, opts) {
       const result = await jwtVerify(id_token, remoteJwks, {
         issuer: platform.issuer,
         audience: platform.clientId,
+        algorithms: ['RS256'],
+        clockTolerance: 30,
       });
       payload = result.payload;
     } catch (err) {
@@ -366,7 +373,7 @@ function createLtiRouter(db, admin, opts) {
     }
 
     return htmlError(res, 400, 'Unsupported launch type', `Message type "${messageType || 'unknown'}" isn't supported.`);
-  });
+  }));
 
   // -------------------------------------------------------------------
   // GET /lti/session?code=... — the frontend exchanges a one-time code
@@ -376,7 +383,7 @@ function createLtiRouter(db, admin, opts) {
   // alive until /lti/deep-link/complete consumes them — the lecturer needs
   // time to pick a test.
   // -------------------------------------------------------------------
-  router.get('/session', async (req, res) => {
+  router.get('/session', wrap(async (req, res) => {
     const code = typeof req.query.code === 'string' ? req.query.code : '';
     if (!code) return res.status(400).json({ ok: false, error: 'Missing code.' });
 
@@ -441,7 +448,7 @@ function createLtiRouter(db, admin, opts) {
     }
 
     return res.status(400).json({ ok: false, error: 'Unknown launch kind.' });
-  });
+  }));
 
   // -------------------------------------------------------------------
   // POST /lti/deep-link/complete  { code, testId }  (Authorization: Bearer
@@ -451,7 +458,7 @@ function createLtiRouter(db, admin, opts) {
   // and hands back the JWT + the platform's return URL for the frontend
   // to form_post there (a real page navigation back into Moodle).
   // -------------------------------------------------------------------
-  router.post('/deep-link/complete', async (req, res) => {
+  router.post('/deep-link/complete', wrap(async (req, res) => {
     const authHeader = req.headers.authorization || '';
     const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
     if (!idToken) return res.status(401).json({ ok: false, error: 'Not signed in.' });
@@ -516,7 +523,7 @@ function createLtiRouter(db, admin, opts) {
 
     await ref.delete();
     res.json({ ok: true, returnUrl: launch.deepLinkReturnUrl, jwt });
-  });
+  }));
 
   return router;
 }
@@ -562,6 +569,20 @@ async function fetchWithBoundedRetry(url, opts, { maxAttempts = 3, baseDelayMs =
   throw lastErr;
 }
 
+// True only for an https URL whose origin matches the registered platform's
+// issuer / token / login endpoint origins.
+function isTrustedLineitemUrl(url, platform) {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'https:' || u.username || u.password) return false;
+    const allowed = new Set();
+    for (const v of [platform.issuer, platform.authTokenUrl, platform.authLoginUrl]) {
+      try { allowed.add(new URL(v).origin); } catch (_) { /* ignore malformed */ }
+    }
+    return allowed.has(u.origin);
+  } catch (_) { return false; }
+}
+
 async function pushGradeToLti(db, { testId, submissionId, scoreGiven, scoreMaximum }) {
   const subSnap = await db.collection('tests').doc(testId).collection('submissions').doc(submissionId).get();
   if (!subSnap.exists) return { ok: false, error: 'Submission not found.' };
@@ -573,6 +594,16 @@ async function pushGradeToLti(db, { testId, submissionId, scoreGiven, scoreMaxim
   const platformSnap = await db.collection('ltiPlatforms').doc(sub.ltiPlatformId).get();
   if (!platformSnap.exists) return { ok: false, error: 'Moodle site no longer registered.' };
   const platform = platformSnap.data();
+
+  // ltiLineitemUrl is written by the STUDENT's browser when the submission is
+  // created (firestore.rules only type-checks it), so it is untrusted. The AGS
+  // access token below must only ever be sent to the registered Moodle site.
+  if (!isTrustedLineitemUrl(sub.ltiLineitemUrl, platform)) {
+    return { ok: false, error: 'This submission\'s Moodle gradebook link is not on the registered Moodle site.' };
+  }
+  if (!Number.isFinite(scoreGiven) || !Number.isFinite(scoreMaximum) || scoreMaximum <= 0 || scoreGiven < 0 || scoreGiven > scoreMaximum) {
+    return { ok: false, error: 'Invalid score.' };
+  }
 
   let signingKey;
   try {
@@ -639,4 +670,4 @@ async function pushGradeToLti(db, { testId, submissionId, scoreGiven, scoreMaxim
   return { ok: true };
 }
 
-module.exports = { createLtiRouter, pushGradeToLti };
+module.exports = { createLtiRouter, pushGradeToLti, isTrustedLineitemUrl };

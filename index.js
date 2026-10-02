@@ -37,6 +37,34 @@ const { createLtiRouter, pushGradeToLti } = require('./lti');
 const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 const app = express();
+// Render terminates TLS at one proxy hop. Without this, the first X-Forwarded-For
+// entry (which the caller controls) was the rate-limit key, so rotating that
+// header bypassed every limiter.
+app.set('trust proxy', 1);
+
+// Auto-forward rejected promises from any async route registered below to the
+// global error handler (Express 4 otherwise leaves them unhandled).
+for (const m of ['get', 'post', 'put', 'delete']) {
+  const orig = app[m].bind(app);
+  app[m] = (path, ...handlers) => orig(path, ...handlers.map(h =>
+    (typeof h === 'function' && h.constructor.name === 'AsyncFunction') ? asyncHandler(h) : h));
+}
+process.on('unhandledRejection', (reason) => {
+  console.error(JSON.stringify({ level: 'error', event: 'unhandledRejection', message: String((reason && reason.message) || reason) }));
+});
+
+// Structured access log: one JSON line per request with a request id. Never logs
+// bodies, headers, tokens, codes, or query strings.
+app.use((req, res, next) => {
+  const id = crypto.randomUUID();
+  const t0 = Date.now();
+  res.setHeader('X-Request-Id', id);
+  res.on('finish', () => console.log(JSON.stringify({
+    level: res.statusCode >= 500 ? 'error' : 'info', event: 'request', id,
+    method: req.method, path: req.path, status: res.statusCode, ms: Date.now() - t0,
+  })));
+  next();
+});
 app.use(express.json({ limit: '10kb' })); // requests here are tiny; reject anything else outright
 // LTI launches and Deep Linking responses arrive as browser form_posts
 // (application/x-www-form-urlencoded), not JSON.
@@ -163,7 +191,7 @@ setInterval(() => {
 }, 5 * 60 * 1000).unref();
 
 function clientIp(req) {
-  return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
+  return req.ip || req.socket.remoteAddress || 'unknown';
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +262,56 @@ function normId(s) {
   return (s || '').toString().trim().toUpperCase().replace(/\s+/g, '');
 }
 
+// ---------------------------------------------------------------------------
+// Per-student escalating lockout for /verify-student.
+//   - Only WRONG attempts count; a correct name + student number never uses one up.
+//   - CRED_MAX_FAILS wrong attempts inside CRED_FAIL_WINDOW_MS trigger a lockout.
+//   - First lockout lasts CRED_BASE_LOCK_MS; each repeat multiplies it by
+//     CRED_LOCK_FACTOR (3 min, 9 min, 27 min, 81 min ...) up to CRED_MAX_LOCK_MS.
+//   - While locked, every request for that student is refused, even a correct one,
+//     so the lockout can't be probed. A correct match clears the student's record.
+//   - Strike count is forgotten after CRED_STRIKE_MEMORY_MS with no wrong attempts,
+//     counted from the later of the last wrong attempt and the end of the lockout.
+// In-memory, like the other limiters: a Render restart/sleep resets it.
+// ---------------------------------------------------------------------------
+const CRED_MAX_FAILS = 3;
+const CRED_FAIL_WINDOW_MS = 3 * 60 * 1000;
+const CRED_BASE_LOCK_MS = 3 * 60 * 1000;
+const CRED_LOCK_FACTOR = 3;
+const CRED_MAX_LOCK_MS = 24 * 60 * 60 * 1000;
+const CRED_STRIKE_MEMORY_MS = 24 * 60 * 60 * 1000;
+const credState = new Map(); // key -> { fails: number[], strikes: number, lockedUntil: number, lastFailAt: number }
+
+function credLockRemainingMs(key) {
+  const st = credState.get(key);
+  return st ? Math.max(0, st.lockedUntil - Date.now()) : 0;
+}
+// Records one WRONG attempt. Returns the new lockout length in ms, or 0 if not locked.
+function recordCredFailure(key) {
+  const now = Date.now();
+  let st = credState.get(key);
+  if (!st || now - Math.max(st.lastFailAt, st.lockedUntil) > CRED_STRIKE_MEMORY_MS) st = { fails: [], strikes: 0, lockedUntil: 0, lastFailAt: now };
+  st.fails = st.fails.filter(t => now - t < CRED_FAIL_WINDOW_MS);
+  st.fails.push(now);
+  st.lastFailAt = now;
+  let lockMs = 0;
+  if (st.fails.length >= CRED_MAX_FAILS) {
+    lockMs = Math.min(CRED_BASE_LOCK_MS * Math.pow(CRED_LOCK_FACTOR, st.strikes), CRED_MAX_LOCK_MS);
+    st.strikes += 1;
+    st.lockedUntil = now + lockMs;
+    st.fails = [];
+  }
+  credState.set(key, st);
+  return lockMs;
+}
+function clearCredRecord(key) { credState.delete(key); }
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, st] of credState) {
+    if (now - Math.max(st.lastFailAt, st.lockedUntil) > CRED_STRIKE_MEMORY_MS) credState.delete(key);
+  }
+}, 10 * 60 * 1000).unref();
+
 app.use('/verify-student', restrictedCors);
 app.post('/verify-student', async (req, res) => {
   const ip = clientIp(req);
@@ -266,11 +344,14 @@ app.post('/verify-student', async (req, res) => {
   //     above that) rather than for one person at a time.
   const credKey = `student-cred:${testId}:${normId(studentId)}`;
   const ipKey = `student-ip:${ip}`;
-  const credLimited = rateLimited(credKey, 8, 5 * 60 * 1000);
+  // Locked-out student: refuse everything (even a correct answer) until the lock ends.
+  const lockedMs = credLockRemainingMs(credKey);
+  if (lockedMs > 0) {
+    return res.status(429).json({ ok: false, locked: true, error: 'Too many incorrect attempts for this student number. Try again later.', retryAfterSec: Math.ceil(lockedMs / 1000) });
+  }
   const ipLimited = rateLimited(ipKey, 4000, 5 * 60 * 1000);
-  if (credLimited || ipLimited) {
-    const limitedKey = credLimited ? credKey : ipKey;
-    const retryAfterSec = Math.ceil(msUntilSlotMightFree(limitedKey, 5 * 60 * 1000) / 1000);
+  if (ipLimited) {
+    const retryAfterSec = Math.ceil(msUntilSlotMightFree(ipKey, 5 * 60 * 1000) / 1000);
     return res.status(429).json({ ok: false, error: 'Too many attempts — wait a bit and try again.', retryAfterSec });
   }
 
@@ -279,7 +360,12 @@ app.post('/verify-student', async (req, res) => {
     const wantName = normName(name);
     const wantId = normId(studentId);
     const match = entries.some(e => normId(e.studentId) === wantId && normName(e.name) === wantName);
-    res.json({ ok: match });
+    if (match) {
+      clearCredRecord(credKey);
+      return res.json({ ok: true });
+    }
+    const lockMs = recordCredFailure(credKey);
+    res.json(lockMs ? { ok: false, locked: true, retryAfterSec: Math.ceil(lockMs / 1000) } : { ok: false });
   } catch (err) {
     console.error('verify-student error:', err.message);
     res.status(500).json({ ok: false, error: 'Could not check the register right now — try again shortly.' });
@@ -614,7 +700,10 @@ app.post('/lti/push-grade', asyncHandler(async (req, res) => {
   }
 
   const { testId, submissionId, scoreGiven, scoreMaximum } = req.body || {};
-  if (!testId || !submissionId || typeof scoreGiven !== 'number' || typeof scoreMaximum !== 'number') {
+  if (typeof testId !== 'string' || typeof submissionId !== 'string' || !testId || !submissionId
+      || testId.length > 100 || submissionId.length > 100
+      || !Number.isFinite(scoreGiven) || !Number.isFinite(scoreMaximum)
+      || scoreMaximum <= 0 || scoreGiven < 0 || scoreGiven > scoreMaximum) {
     return res.status(400).json({ ok: false, error: 'Missing or malformed fields.' });
   }
 
