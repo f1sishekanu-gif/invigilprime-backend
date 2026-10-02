@@ -110,9 +110,14 @@ if (!FLUTTERWAVE_WEBHOOK_HASH) {
 // the customer's card/region; that settlement amount/currency is recorded
 // separately in the payment record and never treated as the list price.
 // -----------------------------------------------------------------------
+//
+// Pricing model: $1 per student, per course, per month. Annual billing is
+// 12 months of that same rate paid upfront (no separate annual price point).
+// amount = PRICE_PER_STUDENT_PER_COURSE_PER_MONTH_USD x students x courses x months
+const PRICE_PER_STUDENT_PER_COURSE_PER_MONTH_USD = 1.00;
 const PRICING_PLANS = {
-  institution_monthly: { name: 'Institution Plan (Monthly)', priceUSD: 1.00, billingPeriod: 'monthly', perStudent: true },
-  institution_annual: { name: 'Institution Plan (Annual)', priceUSD: 12.00, billingPeriod: 'yearly', perStudent: true },
+  institution_monthly: { name: 'Institution Plan (Monthly)', months: 1, billingPeriod: 'monthly' },
+  institution_annual: { name: 'Institution Plan (Annual)', months: 12, billingPeriod: 'yearly' },
 };
 
 
@@ -426,7 +431,7 @@ app.post('/request-access', async (req, res) => {
 
 // -----------------------------------------------------------------------
 // POST /create-flutterwave-payment
-//   { planId: string, studentCount: number, institutionName?: string, email: string }
+//   { planId: string, studentCount: number, courseCount: number, institutionName?: string, email: string }
 //   (Authorization: Bearer <Firebase ID token>, optional — an
 //   institutional access request can happen before any lecturer account
 //   exists, so this route works either signed-in or signed-out. When
@@ -484,13 +489,17 @@ app.post('/create-flutterwave-payment', async (req, res) => {
   if (!Number.isFinite(studentCount) || studentCount < 1 || studentCount > 200000) {
     return res.status(400).json({ ok: false, error: 'Enter a valid number of students.' });
   }
+  const courseCount = Math.round(Number(req.body?.courseCount));
+  if (!Number.isFinite(courseCount) || courseCount < 1 || courseCount > 1000) {
+    return res.status(400).json({ ok: false, error: 'Enter a valid number of courses.' });
+  }
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().slice(0, 200) : '';
   if (!uid && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return res.status(400).json({ ok: false, error: 'Enter a valid email address.' });
   }
   const institutionName = typeof req.body?.institutionName === 'string' ? req.body.institutionName.trim().slice(0, 200) : '';
 
-  const amountUSD = plan.perStudent ? +(plan.priceUSD * studentCount).toFixed(2) : plan.priceUSD;
+  const amountUSD = +(PRICE_PER_STUDENT_PER_COURSE_PER_MONTH_USD * studentCount * courseCount * plan.months).toFixed(2);
   const payerRef = uid || email;
   const txRef = `INVIGIL-${payerRef.replace(/[^a-zA-Z0-9]/g, '').slice(0, 24)}-${crypto.randomUUID()}`;
 
@@ -500,7 +509,7 @@ app.post('/create-flutterwave-payment', async (req, res) => {
     // the browser's own redirect back) always has a matching record to
     // verify against and update — see /flutterwave/webhook.
     await db.collection('payments').doc(txRef).set({
-      txRef, uid, email: uid ? null : email, planId, studentCount, institutionName,
+      txRef, uid, email: uid ? null : email, planId, studentCount, courseCount, institutionName,
       amountUSD, currency: 'USD', status: 'pending',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -514,8 +523,8 @@ app.post('/create-flutterwave-payment', async (req, res) => {
         currency: 'USD', // Flutterwave may still settle in the customer's local currency; that is recorded separately once known, never used as the list price.
         redirect_url: `${PUBLIC_APP_URL}/?flw_tx_ref=${encodeURIComponent(txRef)}`,
         customer: { email: uid ? (req.body?.email || 'no-email-on-file@invigil') : email, name: institutionName || undefined },
-        customizations: { title: 'Invigil Prime', description: `${plan.name} — ${studentCount} students` },
-        meta: { uid, planId, studentCount, institutionName },
+        customizations: { title: 'Invigil Prime', description: `${plan.name} — ${studentCount} students × ${courseCount} course${courseCount === 1 ? '' : 's'}` },
+        meta: { uid, planId, studentCount, courseCount, institutionName },
       }),
     });
     const flwData = await flwResp.json();
@@ -638,6 +647,7 @@ app.post('/flutterwave/webhook', async (req, res) => {
         status: 'active',
         planId: payment.planId,
         studentCount: payment.studentCount,
+        courseCount: payment.courseCount || null,
         institutionName: payment.institutionName || null,
         currentPeriodEnd: new Date(now + periodMs).toISOString(),
         lastPaymentTxRef: txRef,
